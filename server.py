@@ -2,6 +2,9 @@ import socket
 import threading
 import random
 import hashlib
+import time
+
+import game_logic as gl
 
 HOST = "0.0.0.0"
 PORT = 8080
@@ -11,19 +14,22 @@ GRID_WIDTH = 10
 GRID_HEIGHT = 10
 COIN_COUNT = 5
 
+TICK_RATE = 20
+SNAPSHOT_RATE = 10
+MAX_PLAYERS = 20
+
 server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 server.bind((HOST, PORT))
 
 clients = {}
-players = {}
-names = {}
-scores = {}
-coins = set()
+seq_map = {}
 
 lock = threading.Lock()
 
+
 def generate_token():
     return hashlib.md5(str(random.random()).encode()).hexdigest()[:16]
+
 
 def random_position():
     return (
@@ -31,74 +37,53 @@ def random_position():
         random.randint(0, GRID_HEIGHT - 1)
     )
 
-def spawn_player():
-    while True:
-        pos = random_position()
-        if pos not in players.values():
-            return pos
 
-def spawn_coins():
-    coins.clear()
-    while len(coins) < COIN_COUNT:
-        coins.add(random_position())
+def send_with_delay(addr, msg):
+    delay = random.uniform(0, 0.2)
+    time.sleep(delay)
+    server.sendto(msg.encode(), addr)
+
 
 def broadcast(msg):
     for addr in clients.values():
-        server.sendto(msg.encode(), addr)
+        if random.random() < 0.1:
+            continue
+        threading.Thread(target=send_with_delay, args=(addr, msg), daemon=True).start()
+
 
 def broadcast_state():
-    state = ";".join([
-        f"{names[t]}:{x},{y}" for t, (x, y) in players.items()
-    ])
+    broadcast(gl.get_world_state_message())
 
-    coin_data = ";".join([
-        f"{x},{y}" for (x, y) in coins
-    ])
-
-    broadcast(f"STATE|{state}|COINS|{coin_data}")
 
 def broadcast_scores():
-    score_msg = ";".join([
-        f"{names[t]}:{scores[t]}" for t in scores
-    ])
-    broadcast(f"SCORE|{score_msg}")
+    broadcast(gl.get_scoreboard_message())
 
-def move_player(pos, move):
-    x, y = pos
 
-    if move == "UP":
-        y += 1
-    elif move == "DOWN":
-        y -= 1
-    elif move == "LEFT":
-        x -= 1
-    elif move == "RIGHT":
-        x += 1
-
-    x = max(0, min(GRID_WIDTH - 1, x))
-    y = max(0, min(GRID_HEIGHT - 1, y))
-
-    return (x, y)
-
-def handle_packet(data, addr):
+def handle_packet(data, addr, current_tick):
     try:
         msg = data.decode()
 
+        # JOIN
         if msg == "JOIN":
             token = generate_token()
-            name = f"Player{len(players) + 1}"
+            name = f"Player{len(clients) + 1}"
 
             with lock:
+                if len(clients) >= MAX_PLAYERS:
+                    server.sendto("CLOSE".encode(), addr)
+                    return
                 clients[token] = addr
-                players[token] = spawn_player()
-                names[token] = name
-                scores[token] = 0
+                seq_map[token] = 0
+                if not gl.add_player(token, name):
+                    server.sendto("CLOSE".encode(), addr)
+                    return
 
             server.sendto(f"WELCOME|{token}|{name}".encode(), addr)
             return
 
         try:
             token, seq, move, recv_hash = msg.split("|")
+            seq = int(seq)
         except:
             return
 
@@ -109,68 +94,87 @@ def handle_packet(data, addr):
             return
 
         with lock:
-            if token not in players:
+
+            if token not in clients:
                 return
 
-            new_pos = move_player(players[token], move)
-            players[token] = new_pos
+            # sequence check
+            if seq <= seq_map[token]:
+                server.sendto(f"ACK|{seq}".encode(), addr)
+                return
+            seq_map[token] = seq
 
-            # COINS
-            if new_pos in coins:
-                coins.remove(new_pos)
-                scores[token] += 10
+            status, new_pos, _collected = gl.move_player(token, move, current_tick)
 
-                while True:
-                    c = random_position()
-                    if c not in players.values() and c not in coins:
-                        coins.add(c)
-                        break
+            server.sendto(f"ACK|{seq}".encode(), addr)
 
-            # COLLISION
-            hit_token = None
+            if status != "OK":
+                server.sendto(status.encode(), addr)
+                return
 
-            for other_token, other_pos in players.items():
-                if other_token == token:
-                    continue
-                if new_pos == other_pos:
-                    hit_token = other_token
-                    break
+            player_name = gl.get_player_name(token)
+            print(f"MOVE {player_name} seq={seq} cmd={move} pos={new_pos}")
 
-            if hit_token:
-                killer = names[token]
-                victim = names[hit_token]
+            victims = gl.detect_collisions_at(new_pos, excluding_token=token)
+
+            for victim_token in victims:
+                killer = gl.get_player_name(token)
+                victim = gl.get_player_name(victim_token)
 
                 print(f"{killer} killed {victim}")
 
-                scores[token] += 20
+                gl.award_kill(token, points=20)
 
-                # notify victim
-                server.sendto("YOU_ELIMINATED".encode(), clients[hit_token])
-
-                # notify killer
+                server.sendto("YOU_ELIMINATED".encode(), clients[victim_token])
+                server.sendto(f"YOU_ELIMINATED|{killer}".encode(), clients[victim_token])
                 server.sendto(f"KILL|{victim}".encode(), clients[token])
 
-                # remove victim
-                del players[hit_token]
-                del clients[hit_token]
-                del names[hit_token]
-                del scores[hit_token]
+                gl.remove_player(victim_token)
+                del clients[victim_token]
+                del seq_map[victim_token]
 
             # WIN CONDITION
-            if len(players) == 1:
-                winner_token = list(players.keys())[0]
-                winner_name = names[winner_token]
+            winner_name = gl.check_winner()
+            if winner_name:
                 broadcast(f"GAME_OVER|{winner_name}")
-
-            broadcast_state()
-            broadcast_scores()
 
     except Exception as e:
         print("SERVER ERROR:", e)
 
-spawn_coins()
+
+gl.configure(GRID_WIDTH, GRID_HEIGHT, COIN_COUNT)
+gl.spawn_coins()
 print("Server running...")
 
+tick_interval = 1.0 / TICK_RATE
+snapshot_interval = 1.0 / SNAPSHOT_RATE
+
+current_tick = 0
+next_tick = time.time() + tick_interval
+next_snapshot = time.time() + snapshot_interval
+
 while True:
-    data, addr = server.recvfrom(1024)
-    threading.Thread(target=handle_packet, args=(data, addr)).start()
+    now = time.time()
+    wait_until = min(next_tick, next_snapshot)
+    timeout = max(0.0, wait_until - now)
+
+    server.settimeout(timeout)
+
+    try:
+        data, addr = server.recvfrom(1024)
+        handle_packet(data, addr, current_tick)
+    except socket.timeout:
+        pass
+    except ConnectionResetError:
+        pass
+
+    now = time.time()
+
+    while now >= next_tick:
+        current_tick += 1
+        next_tick += tick_interval
+
+    if now >= next_snapshot:
+        broadcast_state()
+        broadcast_scores()
+        next_snapshot += snapshot_interval
