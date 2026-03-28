@@ -9,7 +9,6 @@ SECRET = "network_secret"
 
 client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# join server
 client.sendto("JOIN".encode(), (SERVER_IP, PORT))
 
 data, _ = client.recvfrom(1024)
@@ -22,12 +21,13 @@ print("Connected as", name)
 seq = 0
 alive = True
 
+x, y = 0, 0
+
 
 def receive():
-    global alive
+    global alive, x, y
 
     while True:
-
         try:
             data, _ = client.recvfrom(1024)
         except:
@@ -37,39 +37,52 @@ def receive():
 
         if msg.startswith("STATE"):
 
-            state = msg.split("|")[1]
-            players = state.split(";")
-
             print("\nWorld State")
 
-            for p in players:
+            state = msg.split("|")[1].split(";")
+
+            for p in state:
                 n, pos = p.split(":")
-                x, y = pos.split(",")
-                print(f"{n} -> ({x},{y})")
+                sx, sy = map(int, pos.split(","))
 
-        elif msg.startswith("ELIMINATED"):
+                print(f"{n} -> ({sx},{sy})")
 
-            print("\n", msg)
+                if n == name:
+                    if sx != x or sy != y:
+                        x, y = sx, sy
+
+        elif msg.startswith("SCORE"):
+
+            print("\nScoreboard")
+
+            scores = msg.split("|")[1].split(";")
+
+            for s in scores:
+                n, sc = s.split(":")
+                print(f"{n}: {sc}")
 
         elif msg == "YOU_ELIMINATED":
-
-            print("\nYou have been eliminated!")
+            print("You have been eliminated")
             alive = False
 
-        elif msg.startswith("GAME_OVER"):
+        elif msg.startswith("ELIMINATED"):
+            print(msg)
 
-            print("\n", msg)
+        elif msg == "BLOCKED":
+            print("Move blocked")
+
+        elif msg == "COOLDOWN":
+            print("Too fast")
+
+        elif msg.startswith("GAME_OVER"):
+            print(msg)
 
         elif msg == "CLOSE":
-
-            print("\nConnection closed by server")
-
+            print("Connection closed")
             client.close()
-
             os._exit(0)
 
 
-# start receive thread
 threading.Thread(target=receive, daemon=True).start()
 
 
@@ -78,12 +91,20 @@ while True:
     if not alive:
         continue
 
-    cmd = input("\nMove (UP/DOWN/LEFT/RIGHT): ").upper()
+    cmd = input("Move: ").upper()
+
+    if cmd == "UP":
+        y += 1
+    elif cmd == "DOWN":
+        y -= 1
+    elif cmd == "LEFT":
+        x -= 1
+    elif cmd == "RIGHT":
+        x += 1
 
     seq += 1
 
     payload = f"{token}|{seq}|{cmd}"
-
     h = hashlib.sha256((SECRET + payload).encode()).hexdigest()
 
     packet = f"{payload}|{h}"
